@@ -79,6 +79,14 @@ inline constexpr uint8_t PAIR_NUMBER(uint16_t a)
     return (a >> 8) & 0xFF;
 }
 
+inline constexpr char ACS_ULCORNER = '+';
+inline constexpr char ACS_URCORNER = '+';
+inline constexpr char ACS_LLCORNER = '+';
+inline constexpr char ACS_LRCORNER = '+';
+inline constexpr char ACS_HLINE    = '-';
+inline constexpr char ACS_VLINE    = '|';
+inline constexpr char ACS_PLUS     = '+';
+
 // ---------- Abstractions ----------
 struct IFont
 {
@@ -160,8 +168,10 @@ public:
     class Window
     {
     public:
-        Window(Curses& parent, int height, int width, int starty, int startx) :
+        friend class Curses;
+        Window(Curses& parent, Window* parent_win, int height, int width, int starty, int startx) :
             _parent(parent),
+            _parent_win(parent_win),
             _height(0),
             _width(0),
             _starty(0),
@@ -262,7 +272,8 @@ public:
             const int abs_y = _starty + rel_y;
             const int max_w = std::max(1, _width - rel_x);
             const int max_h = std::max(1, _height - rel_y);
-            Window*   child = _parent.newwin(std::clamp(height, 1, max_h), std::clamp(width, 1, max_w), abs_y, abs_x);
+            Window*   child =
+                _parent.newsubwin(this, std::clamp(height, 1, max_h), std::clamp(width, 1, max_w), abs_y, abs_x);
             if (child)
             {
                 child->_attr = _attr;
@@ -273,7 +284,7 @@ public:
 
         Window* subwin(int height, int width, int starty, int startx)
         {
-            Window* child = _parent.subwin(height, width, starty, startx);
+            Window* child = _parent.newsubwin(this, height, width, starty, startx);
             if (child)
             {
                 child->_attr = _attr;
@@ -301,6 +312,64 @@ public:
             va_start(ap, fmt);
             vprintw(fmt, ap);
             va_end(ap);
+        }
+
+        void hline(char ch, int n)
+        {
+            if (!has_area() || n <= 0)
+                return;
+            const int left        = inner_left();
+            const int right_excl  = inner_right_exclusive();
+            const int top         = inner_top();
+            const int bottom_excl = inner_bottom_exclusive();
+            if (right_excl <= left || bottom_excl <= top)
+                return;
+
+            const int      row   = std::clamp(_cury, top, bottom_excl - 1);
+            int            col   = std::clamp(_curx, left, right_excl - 1);
+            const int      limit = std::min(std::max(right_excl - col, 0), n);
+            const uint16_t attr  = current_attr();
+            for (int i = 0; i < limit; ++i)
+                write_cell(col + i, row, ch, attr);
+            if (limit > 0)
+                _curx = col + limit - 1;
+            _cury = row;
+        }
+
+        void vline(char ch, int n)
+        {
+            if (!has_area() || n <= 0)
+                return;
+            const int left        = inner_left();
+            const int right_excl  = inner_right_exclusive();
+            const int top         = inner_top();
+            const int bottom_excl = inner_bottom_exclusive();
+            if (right_excl <= left || bottom_excl <= top)
+                return;
+
+            const int      col   = std::clamp(_curx, left, right_excl - 1);
+            int            row   = std::clamp(_cury, top, bottom_excl - 1);
+            const int      limit = std::min(std::max(bottom_excl - row, 0), n);
+            const uint16_t attr  = current_attr();
+            for (int i = 0; i < limit; ++i)
+                write_cell(col, row + i, ch, attr);
+            if (limit > 0)
+                _cury = row + limit - 1;
+            _curx = col;
+        }
+
+        void box(char vert = ACS_VLINE, char horiz = ACS_HLINE)
+        {
+            border(vert, vert, horiz, horiz, ACS_ULCORNER, ACS_URCORNER, ACS_LLCORNER, ACS_LRCORNER);
+        }
+
+        void touchwin(bool recurse = true)
+        {
+            _parent._dirty_all = true;
+            if (recurse)
+                for (Window* child : _children)
+                    if (child)
+                        child->touchwin(true);
         }
 
         void clear()
@@ -485,13 +554,22 @@ public:
 
         uint16_t current_attr() const { return static_cast<uint16_t>(_attr | COLOR_PAIR(_pair)); }
 
-        Curses&  _parent;
-        int      _height, _width;
-        int      _starty, _startx;
-        int      _curx, _cury;
-        uint16_t _attr;
-        uint8_t  _pair;
-        bool     _has_border;
+        Curses&              _parent;
+        Window*              _parent_win;
+        int                  _height, _width;
+        int                  _starty, _startx;
+        int                  _curx, _cury;
+        uint16_t             _attr;
+        uint8_t              _pair;
+        bool                 _has_border;
+        std::vector<Window*> _children;
+
+        void detach_child(Window* child)
+        {
+            auto it = std::remove(_children.begin(), _children.end(), child);
+            if (it != _children.end())
+                _children.erase(it, _children.end());
+        }
     };
 
     Curses(ICursesDisplay& disp, ICursesInput& in, IFont& font) :
@@ -526,23 +604,19 @@ public:
 
     Window* newwin(int height, int width, int starty, int startx)
     {
-        auto    win = std::make_unique<Window>(*this, height, width, starty, startx);
-        Window* ptr = win.get();
-        _windows.push_back(std::move(win));
-        return ptr;
+        return create_window(nullptr, height, width, starty, startx);
     }
 
-    Window* subwin(int height, int width, int starty, int startx) { return newwin(height, width, starty, startx); }
+    Window* subwin(int height, int width, int starty, int startx)
+    {
+        return create_window(nullptr, height, width, starty, startx);
+    }
 
     void delwin(Window* win)
     {
         if (!win)
             return;
-        auto it = std::find_if(_windows.begin(), _windows.end(), [win](const auto& candidate) {
-            return candidate.get() == win;
-        });
-        if (it != _windows.end())
-            _windows.erase(it);
+        destroy_window(win);
     }
 
     // Drawing
@@ -688,6 +762,7 @@ public:
     void cbreak(bool en) { _cbreak = en; }
     void curs_set(bool vis) { _curs_vis = vis; }
     void keypad(bool en) { _keypad = en; }
+    void touchwin() { _dirty_all = true; }
 
     // Input
     int getch()
@@ -964,6 +1039,44 @@ private:
     ColorPair                            _pairs[MAX_COLOR_PAIRS];
     std::deque<int>                      _pending_keys;
     std::vector<std::unique_ptr<Window>> _windows;
+
+    Window* create_window(Window* parent_win, int height, int width, int starty, int startx)
+    {
+        auto    win = std::make_unique<Window>(*this, parent_win, height, width, starty, startx);
+        Window* ptr = win.get();
+        _windows.push_back(std::move(win));
+        if (parent_win)
+            parent_win->_children.push_back(ptr);
+        return ptr;
+    }
+
+    Window* newsubwin(Window* parent_win, int height, int width, int starty, int startx)
+    {
+        return create_window(parent_win, height, width, starty, startx);
+    }
+
+    void destroy_window(Window* win)
+    {
+        if (!win)
+            return;
+
+        auto children = win->_children;
+        for (Window* child : children)
+            destroy_window(child);
+        win->_children.clear();
+
+        if (win->_parent_win)
+            win->_parent_win->detach_child(win);
+
+        auto it = std::find_if(_windows.begin(), _windows.end(), [win](const auto& candidate) {
+            return candidate.get() == win;
+        });
+        if (it != _windows.end())
+        {
+            win->_parent._dirty_all = true;
+            _windows.erase(it);
+        }
+    }
 };
 
 // ---------- Global wrappers (optional) ----------
@@ -1276,6 +1389,45 @@ inline void getmaxyx(WINDOW* win, int& y, int& x)
         y = 0;
         x = 0;
     }
+}
+
+inline void touchwin(WINDOW* win)
+{
+    if (win)
+        win->touchwin(true);
+    else
+        scr().touchwin();
+}
+inline void whline(WINDOW* win, char ch, int n)
+{
+    if (win)
+        win->hline(ch, n);
+}
+inline void wvline(WINDOW* win, char ch, int n)
+{
+    if (win)
+        win->vline(ch, n);
+}
+inline void mvwhline(WINDOW* win, int y, int x, char ch, int n)
+{
+    if (win)
+    {
+        win->move(y, x);
+        win->hline(ch, n);
+    }
+}
+inline void mvwvline(WINDOW* win, int y, int x, char ch, int n)
+{
+    if (win)
+    {
+        win->move(y, x);
+        win->vline(ch, n);
+    }
+}
+inline void box(WINDOW* win, char vert = ACS_VLINE, char horiz = ACS_HLINE)
+{
+    if (win)
+        win->box(vert, horiz);
 }
 
 }  // namespace jsi::ecurses
