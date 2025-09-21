@@ -1,7 +1,14 @@
+/*
+ * Copyright (c) 2025, Joe Inman
+ *
+ * Licensed under the MIT License.
+ * You may obtain a copy of the License at:
+ *     https://opensource.org/licenses/MIT
+ *
+ * This file is part of the EmbedCurses Library.
+ */
+
 #pragma once
-// Minimal, embedded-friendly ncurses-style header (C++)
-// Hardware agnostic via ICursesDisplay / ICursesInput / IFont.
-// License: MIT
 
 #include <cstdint>
 #include <cstdarg>
