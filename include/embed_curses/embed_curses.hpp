@@ -14,6 +14,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <algorithm>
+#include <array>
 #include <deque>
 #include <memory>
 #include <vector>
@@ -78,6 +79,10 @@ inline constexpr uint8_t PAIR_NUMBER(uint16_t a)
 {
     return (a >> 8) & 0xFF;
 }
+
+inline constexpr int KEYMOD_SHIFT = 1 << 16;
+inline constexpr int KEYMOD_ALT   = 1 << 17;
+inline constexpr int KEYMOD_CTRL  = 1 << 18;
 
 inline constexpr char ACS_ULCORNER = '+';
 inline constexpr char ACS_URCORNER = '+';
@@ -363,9 +368,33 @@ public:
             border(vert, vert, horiz, horiz, ACS_ULCORNER, ACS_URCORNER, ACS_LLCORNER, ACS_LRCORNER);
         }
 
+        void touchline(int y, int n, bool changed = true)
+        {
+            if (n <= 0)
+                return;
+            const int start = std::clamp(y, 0, _height > 0 ? _height - 1 : 0);
+            const int count = std::min(std::max(_height - start, 0), n);
+            if (count <= 0)
+                return;
+            _parent.touchline_internal(_starty + start, count, changed);
+        }
+
+        void untouchwin(bool recurse = true)
+        {
+            _parent.touchline_internal(_starty, _height, false);
+            if (recurse)
+                for (Window* child : _children)
+                    if (child)
+                        child->untouchwin(true);
+        }
+
+        bool is_linetouched(int y) const { return _parent.is_linetouched(_starty + y); }
+
+        bool is_wintouched() const { return _parent.is_region_touched(_starty, _height); }
+
         void touchwin(bool recurse = true)
         {
-            _parent._dirty_all = true;
+            _parent.mark_region_dirty(_starty, _height);
             if (recurse)
                 for (Window* child : _children)
                     if (child)
@@ -382,6 +411,7 @@ public:
             _curx       = 0;
             _cury       = 0;
             _has_border = false;
+            _parent.mark_region_dirty(_starty, _height);
         }
 
         void erase() { clear(); }
@@ -526,6 +556,7 @@ public:
                 write_cell(x, bottom_excl - 1, ' ', attr);
             _cury = bottom_excl - 1;
             _curx = left;
+            _parent.mark_region_dirty(_starty + top, bottom_excl - top);
         }
 
         void vprintw(const char* fmt, va_list ap)
@@ -544,6 +575,7 @@ public:
             if (x < 0 || x >= _width || y < 0 || y >= _height)
                 return;
             cell_at(x, y) = Cell{ch, attr};
+            _parent.mark_line_dirty(_starty + y);
         }
 
         void fill_row(int y, int from_x, uint16_t attr)
@@ -592,6 +624,7 @@ public:
         int rows = disp.height_px() / font.glyph_height();
         _buf.resize(cols, rows);
         _pairs[0] = {Color{255, 255, 255}, Color{0, 0, 0}};  // white on black
+        mark_all_dirty();
     }
 
     // Init/teardown
@@ -626,7 +659,7 @@ public:
             for (int x = 0; x < _buf.cols(); ++x)
                 _buf.at(x, y) = Cell{' ', (uint16_t) (_attr | COLOR_PAIR(_pair))};
         _curx = _cury = 0;
-        _dirty_all    = true;
+        mark_all_dirty();
     }
     void erase() { clear(); }
 
@@ -665,6 +698,7 @@ public:
                 scroll();
         }
         _buf.at(_curx, _cury) = Cell{ch, (uint16_t) (_attr | COLOR_PAIR(_pair))};
+        mark_line_dirty(_cury);
         ++_curx;
     }
     void addstr(const char* s)
@@ -753,6 +787,7 @@ public:
     {
         for (int x = _curx; x < _buf.cols(); ++x)
             _buf.at(x, _cury) = Cell{' ', (uint16_t) (_attr | COLOR_PAIR(_pair))};
+        mark_line_dirty(_cury);
     }
 
     // Input-mode controls
@@ -762,7 +797,36 @@ public:
     void cbreak(bool en) { _cbreak = en; }
     void curs_set(bool vis) { _curs_vis = vis; }
     void keypad(bool en) { _keypad = en; }
-    void touchwin() { _dirty_all = true; }
+    void touchwin() { mark_all_dirty(); }
+
+    void touchline(int y, int n) { touchline_internal(y, n, true); }
+    void touchline(int y, int n, bool changed) { touchline_internal(y, n, changed); }
+
+    void untouchwin()
+    {
+        _dirty_all     = false;
+        const int rows = _buf.rows();
+        for (int i = 0; i < rows && i < static_cast<int>(_dirty_lines.size()); ++i)
+            _dirty_lines[i] = false;
+    }
+
+    bool is_linetouched(int y) const
+    {
+        if (y < 0 || y >= _buf.rows())
+            return false;
+        return _dirty_all || _dirty_lines[y];
+    }
+
+    bool is_wintouched() const
+    {
+        if (_dirty_all)
+            return true;
+        const int rows = _buf.rows();
+        for (int i = 0; i < rows; ++i)
+            if (_dirty_lines[i])
+                return true;
+        return false;
+    }
 
     // Input
     int getch()
@@ -789,9 +853,9 @@ public:
                 _buf.at(x, y - 1) = _buf.at(x, y);
         for (int x = 0; x < w; ++x)
             _buf.at(x, h - 1) = Cell{' ', (uint16_t) (_attr | COLOR_PAIR(_pair))};
-        _cury      = h - 1;
-        _curx      = 0;
-        _dirty_all = true;
+        _cury = h - 1;
+        _curx = 0;
+        mark_all_dirty();
     }
 
     // Rendering
@@ -857,6 +921,19 @@ private:
         constexpr int    FOLLOWUP_WAIT_MS = 10;
         std::vector<int> consumed;
 
+        auto apply_modifiers = [](int key, int mod_code) {
+            if (mod_code <= 1)
+                return key;
+            int result = key;
+            if (mod_code == 2 || mod_code == 4 || mod_code == 6 || mod_code == 8)
+                result |= KEYMOD_SHIFT;
+            if (mod_code == 3 || mod_code == 4 || mod_code == 7 || mod_code == 8)
+                result |= KEYMOD_ALT;
+            if (mod_code == 5 || mod_code == 6 || mod_code == 7 || mod_code == 8)
+                result |= KEYMOD_CTRL;
+            return result;
+        };
+
         int second = read_followup_key(FOLLOWUP_WAIT_MS);
         if (second == KEY_NONE)
             return first;  // bare ESC
@@ -864,88 +941,151 @@ private:
 
         if (second == '[')
         {
-            int third = read_followup_key(FOLLOWUP_WAIT_MS);
-            if (third == KEY_NONE)
+            std::vector<int> params;
+            int              current    = 0;
+            bool             in_number  = false;
+            bool             any_param  = false;
+            int              final_char = 0;
+
+            while (true)
+            {
+                int ch = read_followup_key(FOLLOWUP_WAIT_MS);
+                if (ch == KEY_NONE)
+                {
+                    queue_pending(consumed);
+                    return first;
+                }
+                consumed.push_back(ch);
+
+                if (ch >= '0' && ch <= '9')
+                {
+                    current   = current * 10 + (ch - '0');
+                    in_number = true;
+                    any_param = true;
+                    continue;
+                }
+                if (ch == ';')
+                {
+                    params.push_back(in_number ? current : 0);
+                    current   = 0;
+                    in_number = false;
+                    any_param = true;
+                    continue;
+                }
+
+                final_char = ch;
+                if (in_number || any_param)
+                    params.push_back(in_number ? current : 0);
+                break;
+            }
+
+            if (final_char == 0)
             {
                 queue_pending(consumed);
                 return first;
             }
-            consumed.push_back(third);
 
-            switch (third)
+            int mod_code = (params.size() >= 2) ? (params.back() == 0 ? 1 : params.back()) : 1;
+            int base     = 0;
+
+            switch (final_char)
             {
             case 'A':
-                return KEY_UP;
-            case 'B':
-                return KEY_DOWN;
-            case 'C':
-                return KEY_RIGHT;
-            case 'D':
-                return KEY_LEFT;
-            case 'H':
-                return KEY_HOME;
-            case 'F':
-                return KEY_END;
-            default:
+                base = KEY_UP;
                 break;
-            }
-
-            if (third >= '0' && third <= '9')
+            case 'B':
+                base = KEY_DOWN;
+                break;
+            case 'C':
+                base = KEY_RIGHT;
+                break;
+            case 'D':
+                base = KEY_LEFT;
+                break;
+            case 'H':
+                base = KEY_HOME;
+                break;
+            case 'F':
+                base = KEY_END;
+                break;
+            case 'P':
+                base = KEY_F1;
+                break;
+            case 'Q':
+                base = KEY_F2;
+                break;
+            case 'R':
+                base = KEY_F3;
+                break;
+            case 'S':
+                base = KEY_F4;
+                break;
+            case '~':
             {
-                int code = third - '0';
-                while (true)
+                if (params.empty())
                 {
-                    int next = read_followup_key(FOLLOWUP_WAIT_MS);
-                    if (next == KEY_NONE)
-                    {
-                        queue_pending(consumed);
-                        return first;
-                    }
-                    consumed.push_back(next);
-                    if (next >= '0' && next <= '9')
-                    {
-                        code = code * 10 + (next - '0');
-                        continue;
-                    }
-                    if (next == '~')
-                    {
-                        switch (code)
-                        {
-                        case 1:
-                        case 7:
-                            return KEY_HOME;
-                        case 4:
-                        case 8:
-                            return KEY_END;
-                        case 5:
-                            return KEY_PGUP;
-                        case 6:
-                            return KEY_PGDN;
-                        case 15:
-                            return KEY_F5;
-                        case 17:
-                            return KEY_F6;
-                        case 18:
-                            return KEY_F7;
-                        case 19:
-                            return KEY_F8;
-                        case 20:
-                            return KEY_F9;
-                        case 21:
-                            return KEY_F10;
-                        default:
-                            queue_pending(consumed);
-                            return first;
-                        }
-                    }
-
                     queue_pending(consumed);
                     return first;
                 }
+                int code = params[0];
+                switch (code)
+                {
+                case 1:
+                case 7:
+                    base = KEY_HOME;
+                    break;
+                case 4:
+                case 8:
+                    base = KEY_END;
+                    break;
+                case 5:
+                    base = KEY_PGUP;
+                    break;
+                case 6:
+                    base = KEY_PGDN;
+                    break;
+                case 11:
+                    base = KEY_F1;
+                    break;
+                case 12:
+                    base = KEY_F2;
+                    break;
+                case 13:
+                    base = KEY_F3;
+                    break;
+                case 14:
+                    base = KEY_F4;
+                    break;
+                case 15:
+                    base = KEY_F5;
+                    break;
+                case 17:
+                    base = KEY_F6;
+                    break;
+                case 18:
+                    base = KEY_F7;
+                    break;
+                case 19:
+                    base = KEY_F8;
+                    break;
+                case 20:
+                    base = KEY_F9;
+                    break;
+                case 21:
+                    base = KEY_F10;
+                    break;
+                default:
+                    queue_pending(consumed);
+                    return first;
+                }
+                break;
+            }
+            default:
+                queue_pending(consumed);
+                return first;
             }
 
-            queue_pending(consumed);
-            return first;
+            return apply_modifiers(base, mod_code);
         }
         else if (second == 'O')
         {
@@ -984,6 +1124,8 @@ private:
         const int gh = _font.glyph_height();
         for (int y = 0; y < _buf.rows(); ++y)
         {
+            if (!_dirty_all && !_dirty_lines[y])
+                continue;
             for (int x = 0; x < _buf.cols(); ++x)
             {
                 const Cell&     c        = _buf.at(x, y);
@@ -997,6 +1139,7 @@ private:
                 Color           bg       = reverse ? cp.fg : cp.bg;
                 _disp.draw_glyph(x * gw, y * gh, ch, bm, gw, gh, fg, bg, bold, reverse);
             }
+            _dirty_lines[y] = false;
         }
         if (_curs_vis)
         {
@@ -1039,6 +1182,7 @@ private:
     ColorPair                            _pairs[MAX_COLOR_PAIRS];
     std::deque<int>                      _pending_keys;
     std::vector<std::unique_ptr<Window>> _windows;
+    std::array<bool, MAX_ROWS>           _dirty_lines{};
 
     Window* create_window(Window* parent_win, int height, int width, int starty, int startx)
     {
@@ -1073,9 +1217,79 @@ private:
         });
         if (it != _windows.end())
         {
-            win->_parent._dirty_all = true;
+            mark_region_dirty(win->_starty, win->_height);
             _windows.erase(it);
         }
+    }
+
+    void mark_line_dirty(int y)
+    {
+        if (y < 0 || y >= _buf.rows())
+            return;
+        _dirty_lines[y] = true;
+    }
+
+    void mark_region_dirty(int start, int count) { touchline_internal(start, count, true); }
+
+    void mark_all_dirty()
+    {
+        _dirty_all     = true;
+        const int rows = _buf.rows();
+        for (int i = 0; i < rows && i < static_cast<int>(_dirty_lines.size()); ++i)
+            _dirty_lines[i] = true;
+    }
+
+    void touchline_internal(int start, int count, bool value)
+    {
+        if (count <= 0)
+            return;
+        int rows = _buf.rows();
+        if (rows <= 0)
+            return;
+        if (start < 0)
+        {
+            count += start;
+            start = 0;
+        }
+        if (count <= 0)
+            return;
+        const int end = std::min(start + count, rows);
+        for (int i = start; i < end; ++i)
+            _dirty_lines[i] = value;
+        if (!value)
+        {
+            if (!_dirty_all)
+                return;
+            for (int i = 0; i < rows; ++i)
+            {
+                if (_dirty_lines[i])
+                    return;
+            }
+            _dirty_all = false;
+        }
+    }
+
+    bool is_region_touched(int start, int count) const
+    {
+        if (_dirty_all)
+            return true;
+        if (count <= 0)
+            return false;
+        int rows = _buf.rows();
+        if (rows <= 0)
+            return false;
+        if (start < 0)
+        {
+            count += start;
+            start = 0;
+        }
+        if (count <= 0)
+            return false;
+        const int end = std::min(start + count, rows);
+        for (int i = start; i < end; ++i)
+            if (_dirty_lines[i])
+                return true;
+        return false;
     }
 };
 
@@ -1391,12 +1605,61 @@ inline void getmaxyx(WINDOW* win, int& y, int& x)
     }
 }
 
+inline void touchwin()
+{
+    scr().touchwin();
+}
 inline void touchwin(WINDOW* win)
 {
     if (win)
         win->touchwin(true);
     else
         scr().touchwin();
+}
+inline void untouchwin()
+{
+    scr().untouchwin();
+}
+inline void untouchwin(WINDOW* win)
+{
+    if (win)
+        win->untouchwin(true);
+    else
+        scr().untouchwin();
+}
+inline void touchline(int y, int n)
+{
+    scr().touchline(y, n);
+}
+inline void touchline(WINDOW* win, int y, int n)
+{
+    if (win)
+        win->touchline(y, n, true);
+    else
+        scr().touchline(y, n);
+}
+inline void wtouchln(WINDOW* win, int y, int n, int changed)
+{
+    if (win)
+        win->touchline(y, n, changed != 0);
+    else
+        scr().touchline(y, n, changed != 0);
+}
+inline bool is_linetouched(int y)
+{
+    return scr().is_linetouched(y);
+}
+inline bool is_linetouched(WINDOW* win, int y)
+{
+    return win ? win->is_linetouched(y) : scr().is_linetouched(y);
+}
+inline bool is_wintouched()
+{
+    return scr().is_wintouched();
+}
+inline bool is_wintouched(WINDOW* win)
+{
+    return win ? win->is_wintouched() : scr().is_wintouched();
 }
 inline void whline(WINDOW* win, char ch, int n)
 {
