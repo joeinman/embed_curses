@@ -13,6 +13,10 @@
 #include <cstdint>
 #include <cstdarg>
 #include <cstdio>
+#include <algorithm>
+#include <deque>
+#include <memory>
+#include <vector>
 
 namespace jsi::ecurses
 {
@@ -153,6 +157,343 @@ template <int MAX_COLS = 120, int MAX_ROWS = 60>
 class Curses
 {
 public:
+    class Window
+    {
+    public:
+        Window(Curses& parent, int height, int width, int starty, int startx) :
+            _parent(parent),
+            _height(0),
+            _width(0),
+            _starty(0),
+            _startx(0),
+            _curx(0),
+            _cury(0),
+            _attr(parent._attr),
+            _pair(parent._pair),
+            _has_border(false)
+        {
+            const int max_cols = parent._buf.cols();
+            const int max_rows = parent._buf.rows();
+            if (max_cols > 0 && max_rows > 0)
+            {
+                _startx = std::clamp(startx, 0, max_cols - 1);
+                _starty = std::clamp(starty, 0, max_rows - 1);
+                _width  = std::clamp(width, 1, max_cols - _startx);
+                _height = std::clamp(height, 1, max_rows - _starty);
+            }
+        }
+
+        void move(int y, int x)
+        {
+            if (!has_area())
+                return;
+            _cury = std::clamp(y, 0, _height - 1);
+            _curx = std::clamp(x, 0, _width - 1);
+        }
+
+        void addch(char ch)
+        {
+            if (!has_area())
+                return;
+
+            const int left        = inner_left();
+            const int top         = inner_top();
+            const int right_excl  = inner_right_exclusive();
+            const int bottom_excl = inner_bottom_exclusive();
+            if (right_excl <= left || bottom_excl <= top)
+                return;
+
+            _curx = std::clamp(_curx, left, right_excl - 1);
+            _cury = std::clamp(_cury, top, bottom_excl - 1);
+
+            if (ch == '\n')
+            {
+                _curx = left;
+                if (++_cury >= bottom_excl)
+                    scroll();
+                return;
+            }
+            if (ch == '\r')
+            {
+                _curx = left;
+                return;
+            }
+            if (ch == '\b')
+            {
+                if (_curx > left)
+                    --_curx;
+                return;
+            }
+            if (_curx >= right_excl)
+            {
+                _curx = left;
+                if (++_cury >= bottom_excl)
+                    scroll();
+            }
+            write_cell(_curx, _cury, ch, current_attr());
+            ++_curx;
+        }
+
+        void addstr(const char* s)
+        {
+            if (!s)
+                return;
+            while (*s)
+                addch(*s++);
+        }
+
+        void mvaddch(int y, int x, char ch)
+        {
+            move(y, x);
+            addch(ch);
+        }
+
+        void mvaddstr(int y, int x, const char* s)
+        {
+            move(y, x);
+            addstr(s);
+        }
+
+        Window* derwin(int height, int width, int starty, int startx)
+        {
+            const int rel_x = std::clamp(startx, 0, _width > 0 ? _width - 1 : 0);
+            const int rel_y = std::clamp(starty, 0, _height > 0 ? _height - 1 : 0);
+            const int abs_x = _startx + rel_x;
+            const int abs_y = _starty + rel_y;
+            const int max_w = std::max(1, _width - rel_x);
+            const int max_h = std::max(1, _height - rel_y);
+            Window*   child = _parent.newwin(std::clamp(height, 1, max_h), std::clamp(width, 1, max_w), abs_y, abs_x);
+            if (child)
+            {
+                child->_attr = _attr;
+                child->_pair = _pair;
+            }
+            return child;
+        }
+
+        Window* subwin(int height, int width, int starty, int startx)
+        {
+            Window* child = _parent.subwin(height, width, starty, startx);
+            if (child)
+            {
+                child->_attr = _attr;
+                child->_pair = _pair;
+            }
+            return child;
+        }
+
+        void printw(const char* fmt, ...)
+        {
+            if (!fmt)
+                return;
+            va_list ap;
+            va_start(ap, fmt);
+            vprintw(fmt, ap);
+            va_end(ap);
+        }
+
+        void mvprintw(int y, int x, const char* fmt, ...)
+        {
+            move(y, x);
+            if (!fmt)
+                return;
+            va_list ap;
+            va_start(ap, fmt);
+            vprintw(fmt, ap);
+            va_end(ap);
+        }
+
+        void clear()
+        {
+            if (!has_area())
+                return;
+            const uint16_t attr = current_attr();
+            for (int y = 0; y < _height; ++y)
+                fill_row(y, 0, attr);
+            _curx       = 0;
+            _cury       = 0;
+            _has_border = false;
+        }
+
+        void erase() { clear(); }
+
+        void border(char ls = '|',
+                    char rs = '|',
+                    char ts = '-',
+                    char bs = '-',
+                    char tl = '+',
+                    char tr = '+',
+                    char bl = '+',
+                    char br = '+')
+        {
+            if (_width <= 1 || _height <= 1)
+            {
+                _has_border = false;
+                return;
+            }
+
+            const uint16_t attr     = current_attr();
+            const int      last_col = _width - 1;
+            const int      last_row = _height - 1;
+
+            write_cell(0, 0, tl, attr);
+            write_cell(last_col, 0, tr, attr);
+            write_cell(0, last_row, bl, attr);
+            write_cell(last_col, last_row, br, attr);
+
+            for (int x = 1; x < last_col; ++x)
+            {
+                write_cell(x, 0, ts, attr);
+                write_cell(x, last_row, bs, attr);
+            }
+            for (int y = 1; y < last_row; ++y)
+            {
+                write_cell(0, y, ls, attr);
+                write_cell(last_col, y, rs, attr);
+            }
+
+            _has_border    = true;
+            const int left = inner_left();
+            const int top  = inner_top();
+            if (inner_right_exclusive() > left && inner_bottom_exclusive() > top)
+            {
+                _curx = left;
+                _cury = top;
+            }
+        }
+
+        void clrtoeol()
+        {
+            if (!has_area())
+                return;
+            const int left        = inner_left();
+            const int right_excl  = inner_right_exclusive();
+            const int top         = inner_top();
+            const int bottom_excl = inner_bottom_exclusive();
+            if (right_excl <= left || bottom_excl <= top)
+                return;
+            if (_cury < top || _cury >= bottom_excl)
+                return;
+
+            const uint16_t attr  = current_attr();
+            const int      start = std::clamp(_curx, left, right_excl - 1);
+            for (int x = start; x < right_excl; ++x)
+                write_cell(x, _cury, ' ', attr);
+        }
+
+        void refresh()
+        {
+            if (!has_area())
+            {
+                _parent.refresh();
+                return;
+            }
+            const int abs_x = _startx + _curx;
+            const int abs_y = _starty + _cury;
+            _parent.refresh_with_cursor(abs_y, abs_x);
+        }
+
+        void attrset(uint16_t a)
+        {
+            _attr = a & 0x00FFu;
+            _pair = PAIR_NUMBER(a);
+        }
+
+        void attron(uint16_t a)
+        {
+            _attr |= (a & 0x00FFu);
+            if (a & 0xFF00u)
+                _pair = PAIR_NUMBER(a);
+        }
+
+        void attroff(uint16_t a) { _attr &= ~(a & 0x00FFu); }
+
+        void getyx(int& y, int& x) const
+        {
+            y = _cury;
+            x = _curx;
+        }
+
+        void getmaxyx(int& y, int& x) const
+        {
+            y = _height;
+            x = _width;
+        }
+
+        void getbegyx(int& y, int& x) const
+        {
+            y = _starty;
+            x = _startx;
+        }
+
+        int getch() { return _parent.getch(); }
+
+        void keypad(bool en) { _parent.keypad(en); }
+
+    private:
+        bool has_area() const { return _width > 0 && _height > 0; }
+
+        int inner_left() const { return _has_border ? 1 : 0; }
+        int inner_top() const { return _has_border ? 1 : 0; }
+        int inner_right_exclusive() const { return _has_border ? std::max(_width - 1, inner_left()) : _width; }
+        int inner_bottom_exclusive() const { return _has_border ? std::max(_height - 1, inner_top()) : _height; }
+
+        void scroll()
+        {
+            if (!has_area())
+                return;
+            const int left        = inner_left();
+            const int right_excl  = inner_right_exclusive();
+            const int top         = inner_top();
+            const int bottom_excl = inner_bottom_exclusive();
+            if (right_excl <= left || bottom_excl <= top)
+                return;
+
+            for (int y = top + 1; y < bottom_excl; ++y)
+                for (int x = left; x < right_excl; ++x)
+                    cell_at(x, y - 1) = cell_at(x, y);
+            const uint16_t attr = current_attr();
+            for (int x = left; x < right_excl; ++x)
+                write_cell(x, bottom_excl - 1, ' ', attr);
+            _cury = bottom_excl - 1;
+            _curx = left;
+        }
+
+        void vprintw(const char* fmt, va_list ap)
+        {
+            char b[256];
+            std::vsnprintf(b, sizeof(b), fmt, ap);
+            addstr(b);
+        }
+
+        Cell& cell_at(int x, int y) { return _parent._buf.at(_startx + x, _starty + y); }
+
+        const Cell& cell_at(int x, int y) const { return _parent._buf.at(_startx + x, _starty + y); }
+
+        void write_cell(int x, int y, char ch, uint16_t attr)
+        {
+            if (x < 0 || x >= _width || y < 0 || y >= _height)
+                return;
+            cell_at(x, y) = Cell{ch, attr};
+        }
+
+        void fill_row(int y, int from_x, uint16_t attr)
+        {
+            for (int x = from_x; x < _width; ++x)
+                write_cell(x, y, ' ', attr);
+        }
+
+        uint16_t current_attr() const { return static_cast<uint16_t>(_attr | COLOR_PAIR(_pair)); }
+
+        Curses&  _parent;
+        int      _height, _width;
+        int      _starty, _startx;
+        int      _curx, _cury;
+        uint16_t _attr;
+        uint8_t  _pair;
+        bool     _has_border;
+    };
+
     Curses(ICursesDisplay& disp, ICursesInput& in, IFont& font) :
         _disp(disp),
         _in(in),
@@ -166,6 +507,7 @@ public:
         _cury(0),
         _attr(A_NORMAL),
         _pair(0),
+        _keypad(false),
         _dirty_all(true)
     {
         int cols = disp.width_px() / font.glyph_width();
@@ -181,6 +523,27 @@ public:
         refresh();
     }
     void endwin() {}
+
+    Window* newwin(int height, int width, int starty, int startx)
+    {
+        auto    win = std::make_unique<Window>(*this, height, width, starty, startx);
+        Window* ptr = win.get();
+        _windows.push_back(std::move(win));
+        return ptr;
+    }
+
+    Window* subwin(int height, int width, int starty, int startx) { return newwin(height, width, starty, startx); }
+
+    void delwin(Window* win)
+    {
+        if (!win)
+            return;
+        auto it = std::find_if(_windows.begin(), _windows.end(), [win](const auto& candidate) {
+            return candidate.get() == win;
+        });
+        if (it != _windows.end())
+            _windows.erase(it);
+    }
 
     // Drawing
     void clear()
@@ -232,7 +595,7 @@ public:
     }
     void addstr(const char* s)
     {
-        while (*s)
+        while (s && *s)
             addch(*s++);
     }
     void mvaddch(int y, int x, char ch)
@@ -248,6 +611,8 @@ public:
 
     void printw(const char* fmt, ...)
     {
+        if (!fmt)
+            return;
         va_list ap;
         va_start(ap, fmt);
         vprintw(fmt, ap);
@@ -256,6 +621,8 @@ public:
     void mvprintw(int y, int x, const char* fmt, ...)
     {
         move(y, x);
+        if (!fmt)
+            return;
         va_list ap;
         va_start(ap, fmt);
         vprintw(fmt, ap);
@@ -320,23 +687,22 @@ public:
     void echo(bool en) { _echo = en; }
     void cbreak(bool en) { _cbreak = en; }
     void curs_set(bool vis) { _curs_vis = vis; }
+    void keypad(bool en) { _keypad = en; }
 
     // Input
     int getch()
     {
-        if (_timeout_ms == 0 || _nodelay)
-            return _in.poll_key();
-        const int step   = 1;
-        int       waited = 0;
-        while (true)
+        if (!_pending_keys.empty())
         {
-            int k = _in.poll_key();
-            if (k != KEY_NONE)
-                return k;
-            if (_timeout_ms > 0 && waited >= _timeout_ms)
-                return KEY_NONE;
-            waited += step;
+            int pending = _pending_keys.front();
+            _pending_keys.pop_front();
+            return pending;
         }
+
+        int key = read_primary_key();
+        if (key == KEY_NONE)
+            return KEY_NONE;
+        return translate_key(key);
     }
 
     // Scrolling
@@ -354,7 +720,190 @@ public:
     }
 
     // Rendering
-    void refresh()
+    void refresh() { render(false, 0, 0); }
+
+    void refresh_with_cursor(int y, int x) { render(true, y, x); }
+
+    // Size
+    int cols() const { return _buf.cols(); }
+    int rows() const { return _buf.rows(); }
+    int curx() const { return _curx; }
+    int cury() const { return _cury; }
+
+    // Optional helpers (useful in demos)
+    uint16_t  cell_attr(int y, int x) const { return _buf.at(x, y).attr; }
+    ColorPair get_pair(uint8_t idx) const { return (idx < MAX_COLOR_PAIRS) ? _pairs[idx] : _pairs[0]; }
+
+private:
+    int read_primary_key()
+    {
+        if (_timeout_ms == 0 || _nodelay)
+            return _in.poll_key();
+        const int step   = 1;
+        int       waited = 0;
+        while (true)
+        {
+            int k = _in.poll_key();
+            if (k != KEY_NONE)
+                return k;
+            if (_timeout_ms > 0 && waited >= _timeout_ms)
+                return KEY_NONE;
+            waited += step;
+        }
+    }
+
+    int read_followup_key(int wait_ms)
+    {
+        if (_nodelay || wait_ms <= 0)
+            return _in.poll_key();
+        const int step   = 1;
+        int       waited = 0;
+        while (waited <= wait_ms)
+        {
+            int k = _in.poll_key();
+            if (k != KEY_NONE)
+                return k;
+            waited += step;
+        }
+        return KEY_NONE;
+    }
+
+    void queue_pending(const std::vector<int>& seq)
+    {
+        for (int v : seq)
+            _pending_keys.push_back(v);
+    }
+
+    int translate_key(int first)
+    {
+        if (!_keypad || first != 27)
+            return first;
+
+        constexpr int    FOLLOWUP_WAIT_MS = 10;
+        std::vector<int> consumed;
+
+        int second = read_followup_key(FOLLOWUP_WAIT_MS);
+        if (second == KEY_NONE)
+            return first;  // bare ESC
+        consumed.push_back(second);
+
+        if (second == '[')
+        {
+            int third = read_followup_key(FOLLOWUP_WAIT_MS);
+            if (third == KEY_NONE)
+            {
+                queue_pending(consumed);
+                return first;
+            }
+            consumed.push_back(third);
+
+            switch (third)
+            {
+            case 'A':
+                return KEY_UP;
+            case 'B':
+                return KEY_DOWN;
+            case 'C':
+                return KEY_RIGHT;
+            case 'D':
+                return KEY_LEFT;
+            case 'H':
+                return KEY_HOME;
+            case 'F':
+                return KEY_END;
+            default:
+                break;
+            }
+
+            if (third >= '0' && third <= '9')
+            {
+                int code = third - '0';
+                while (true)
+                {
+                    int next = read_followup_key(FOLLOWUP_WAIT_MS);
+                    if (next == KEY_NONE)
+                    {
+                        queue_pending(consumed);
+                        return first;
+                    }
+                    consumed.push_back(next);
+                    if (next >= '0' && next <= '9')
+                    {
+                        code = code * 10 + (next - '0');
+                        continue;
+                    }
+                    if (next == '~')
+                    {
+                        switch (code)
+                        {
+                        case 1:
+                        case 7:
+                            return KEY_HOME;
+                        case 4:
+                        case 8:
+                            return KEY_END;
+                        case 5:
+                            return KEY_PGUP;
+                        case 6:
+                            return KEY_PGDN;
+                        case 15:
+                            return KEY_F5;
+                        case 17:
+                            return KEY_F6;
+                        case 18:
+                            return KEY_F7;
+                        case 19:
+                            return KEY_F8;
+                        case 20:
+                            return KEY_F9;
+                        case 21:
+                            return KEY_F10;
+                        default:
+                            queue_pending(consumed);
+                            return first;
+                        }
+                    }
+
+                    queue_pending(consumed);
+                    return first;
+                }
+            }
+
+            queue_pending(consumed);
+            return first;
+        }
+        else if (second == 'O')
+        {
+            int third = read_followup_key(FOLLOWUP_WAIT_MS);
+            if (third == KEY_NONE)
+            {
+                queue_pending(consumed);
+                return first;
+            }
+            consumed.push_back(third);
+            switch (third)
+            {
+            case 'P':
+                return KEY_F1;
+            case 'Q':
+                return KEY_F2;
+            case 'R':
+                return KEY_F3;
+            case 'S':
+                return KEY_F4;
+            default:
+                queue_pending(consumed);
+                return first;
+            }
+        }
+        else
+        {
+            queue_pending(consumed);
+            return first;
+        }
+    }
+
+    void render(bool override_cursor, int cursor_y, int cursor_x)
     {
         const int gw = _font.glyph_width();
         const int gh = _font.glyph_height();
@@ -376,32 +925,25 @@ public:
         }
         if (_curs_vis)
         {
-            _disp.invert_rect(_curx * _font.glyph_width(),
-                              _cury * _font.glyph_height(),
-                              _font.glyph_width(),
-                              _font.glyph_height());
+            const int draw_x = override_cursor ? cursor_x : _curx;
+            const int draw_y = override_cursor ? cursor_y : _cury;
+            if (draw_x >= 0 && draw_x < _buf.cols() && draw_y >= 0 && draw_y < _buf.rows())
+            {
+                _disp.invert_rect(draw_x * gw, draw_y * gh, gw, gh);
+            }
         }
         _disp.present();
         _dirty_all = false;
     }
 
-    // Size
-    int cols() const { return _buf.cols(); }
-    int rows() const { return _buf.rows(); }
-    int curx() const { return _curx; }
-    int cury() const { return _cury; }
-
-    // Optional helpers (useful in demos)
-    uint16_t  cell_attr(int y, int x) const { return _buf.at(x, y).attr; }
-    ColorPair get_pair(uint8_t idx) const { return (idx < MAX_COLOR_PAIRS) ? _pairs[idx] : _pairs[0]; }
-
-private:
     void vprintw(const char* fmt, va_list ap)
     {
         char b[256];
         std::vsnprintf(b, sizeof(b), fmt, ap);
         addstr(b);
     }
+
+    friend class Window;
 
     ICursesDisplay& _disp;
     ICursesInput&   _in;
@@ -416,14 +958,19 @@ private:
     int      _curx, _cury;
     uint16_t _attr;
     uint8_t  _pair;
+    bool     _keypad;
     bool     _dirty_all;
 
-    ColorPair _pairs[MAX_COLOR_PAIRS];
+    ColorPair                            _pairs[MAX_COLOR_PAIRS];
+    std::deque<int>                      _pending_keys;
+    std::vector<std::unique_ptr<Window>> _windows;
 };
 
 // ---------- Global wrappers (optional) ----------
 inline Curses<>* g_active = nullptr;
-inline void      set_active(Curses<>& c)
+using WINDOW              = Curses<>::Window;
+
+inline void set_active(Curses<>& c)
 {
     g_active = &c;
 }
@@ -558,6 +1105,177 @@ inline void getyx(int& y, int& x)
 {
     y = scr().cury();
     x = scr().curx();
+}
+
+inline WINDOW* newwin(int nlines, int ncols, int begin_y, int begin_x)
+{
+    return scr().newwin(nlines, ncols, begin_y, begin_x);
+}
+inline void delwin(WINDOW* win)
+{
+    scr().delwin(win);
+}
+inline WINDOW* subwin(int nlines, int ncols, int begin_y, int begin_x)
+{
+    return scr().subwin(nlines, ncols, begin_y, begin_x);
+}
+inline WINDOW* subwin(WINDOW* win, int nlines, int ncols, int begin_y, int begin_x)
+{
+    return win ? win->subwin(nlines, ncols, begin_y, begin_x) : nullptr;
+}
+inline WINDOW* derwin(WINDOW* win, int nlines, int ncols, int begin_y, int begin_x)
+{
+    return win ? win->derwin(nlines, ncols, begin_y, begin_x) : nullptr;
+}
+inline void wrefresh(WINDOW* win)
+{
+    if (win)
+        win->refresh();
+}
+inline void wclear(WINDOW* win)
+{
+    if (win)
+        win->clear();
+}
+inline void werase(WINDOW* win)
+{
+    if (win)
+        win->erase();
+}
+inline void wborder(WINDOW* win,
+                    char    ls = '|',
+                    char    rs = '|',
+                    char    ts = '-',
+                    char    bs = '-',
+                    char    tl = '+',
+                    char    tr = '+',
+                    char    bl = '+',
+                    char    br = '+')
+{
+    if (win)
+        win->border(ls, rs, ts, bs, tl, tr, bl, br);
+}
+inline void wmove(WINDOW* win, int y, int x)
+{
+    if (win)
+        win->move(y, x);
+}
+inline void waddch(WINDOW* win, char ch)
+{
+    if (win)
+        win->addch(ch);
+}
+inline void waddstr(WINDOW* win, const char* s)
+{
+    if (win)
+        win->addstr(s);
+}
+inline void mvwaddch(WINDOW* win, int y, int x, char ch)
+{
+    if (win)
+        win->mvaddch(y, x, ch);
+}
+inline void mvwaddstr(WINDOW* win, int y, int x, const char* s)
+{
+    if (win)
+        win->mvaddstr(y, x, s);
+}
+inline void wprintw(WINDOW* win, const char* fmt, ...)
+{
+    if (!win || !fmt)
+        return;
+    va_list ap;
+    va_start(ap, fmt);
+    char b[256];
+    std::vsnprintf(b, sizeof(b), fmt, ap);
+    va_end(ap);
+    win->addstr(b);
+}
+inline void mvwprintw(WINDOW* win, int y, int x, const char* fmt, ...)
+{
+    if (!win || !fmt)
+        return;
+    va_list ap;
+    va_start(ap, fmt);
+    char b[256];
+    std::vsnprintf(b, sizeof(b), fmt, ap);
+    va_end(ap);
+    if (win)
+    {
+        win->move(y, x);
+        win->addstr(b);
+    }
+}
+inline void wattrset(WINDOW* win, uint16_t a)
+{
+    if (win)
+        win->attrset(a);
+}
+inline void wattron(WINDOW* win, uint16_t a)
+{
+    if (win)
+        win->attron(a);
+}
+inline void wattroff(WINDOW* win, uint16_t a)
+{
+    if (win)
+        win->attroff(a);
+}
+inline void wclrtoeol(WINDOW* win)
+{
+    if (win)
+        win->clrtoeol();
+}
+inline int wgetch(WINDOW* win)
+{
+    return win ? win->getch() : KEY_NONE;
+}
+inline void keypad(bool en)
+{
+    scr().keypad(en);
+}
+inline void keypad(WINDOW* win, bool en)
+{
+    if (win)
+        win->keypad(en);
+    else
+        scr().keypad(en);
+}
+inline void getyx(WINDOW* win, int& y, int& x)
+{
+    if (win)
+    {
+        win->getyx(y, x);
+    }
+    else
+    {
+        y = 0;
+        x = 0;
+    }
+}
+inline void getbegyx(WINDOW* win, int& y, int& x)
+{
+    if (win)
+    {
+        win->getbegyx(y, x);
+    }
+    else
+    {
+        y = 0;
+        x = 0;
+    }
+}
+inline void getmaxyx(WINDOW* win, int& y, int& x)
+{
+    if (win)
+    {
+        win->getmaxyx(y, x);
+    }
+    else
+    {
+        y = 0;
+        x = 0;
+    }
 }
 
 }  // namespace jsi::ecurses
