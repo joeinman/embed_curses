@@ -46,6 +46,7 @@ enum : int
     KEY_F8        = 0x1118,
     KEY_F9        = 0x1119,
     KEY_F10       = 0x111A,
+    KEY_RESIZE    = 0x1120,
 };
 
 // ---------- Attr & colors ----------
@@ -166,7 +167,7 @@ private:
 };
 
 // ---------- Core ----------
-template <int MAX_COLS = 120, int MAX_ROWS = 60>
+template <int MAX_COLS = 240, int MAX_ROWS = 120>
 class Curses
 {
 public:
@@ -296,6 +297,96 @@ public:
                 child->_pair = _pair;
             }
             return child;
+        }
+
+        bool resize(int height, int width)
+        {
+            if (height <= 0 || width <= 0)
+                return false;
+
+            const int max_cols = _parent._buf.cols();
+            const int max_rows = _parent._buf.rows();
+            if (max_cols <= 0 || max_rows <= 0)
+                return false;
+
+            int new_width  = width;
+            int new_height = height;
+            int new_startx = _startx;
+            int new_starty = _starty;
+            clamp_to_parent_bounds(new_width, new_height, new_startx, new_starty);
+
+            if (new_width == _width && new_height == _height && new_startx == _startx && new_starty == _starty)
+                return true;
+
+            const uint16_t attr = current_attr();
+
+            const int old_startx = _startx;
+            const int old_starty = _starty;
+            clear_region_abs(old_startx, old_starty, _width, _height, attr);
+
+            int dx = new_startx - _startx;
+            int dy = new_starty - _starty;
+
+            _startx = new_startx;
+            _starty = new_starty;
+            _width  = new_width;
+            _height = new_height;
+            _curx   = std::clamp(_curx, 0, _width - 1);
+            _cury   = std::clamp(_cury, 0, _height - 1);
+
+            fill_region_abs(_startx, _starty, _width, _height, ' ', attr);
+
+            bool had_border = _has_border;
+            _has_border     = false;
+            if (had_border)
+                box();
+
+            if (dx != 0 || dy != 0)
+                move_children(dx, dy);
+            adjust_children_after_parent_change();
+            return true;
+        }
+
+        bool mvwin(int starty, int startx)
+        {
+            const int max_cols = _parent._buf.cols();
+            const int max_rows = _parent._buf.rows();
+            if (max_cols <= 0 || max_rows <= 0)
+                return false;
+
+            startx = std::clamp(startx, 0, max_cols - 1);
+            starty = std::clamp(starty, 0, max_rows - 1);
+
+            int target_width  = _width;
+            int target_height = _height;
+            clamp_to_parent_bounds(target_width, target_height, startx, starty);
+
+            if (startx == _startx && starty == _starty)
+                return true;
+
+            const uint16_t attr = current_attr();
+            clear_region_abs(_startx, _starty, _width, _height, attr);
+
+            int dx = startx - _startx;
+            int dy = starty - _starty;
+
+            _startx = startx;
+            _starty = starty;
+            _width  = target_width;
+            _height = target_height;
+            _curx   = std::clamp(_curx, 0, _width - 1);
+            _cury   = std::clamp(_cury, 0, _height - 1);
+
+            fill_region_abs(_startx, _starty, _width, _height, ' ', attr);
+
+            bool had_border = _has_border;
+            _has_border     = false;
+            if (had_border)
+                box();
+
+            move_children(dx, dy);
+            adjust_children_after_parent_change();
+            return true;
         }
 
         void printw(const char* fmt, ...)
@@ -602,6 +693,97 @@ public:
             if (it != _children.end())
                 _children.erase(it, _children.end());
         }
+
+        void clear_region_abs(int abs_x, int abs_y, int width, int height, uint16_t attr)
+        {
+            fill_region_abs(abs_x, abs_y, width, height, ' ', attr);
+        }
+
+        void fill_region_abs(int abs_x, int abs_y, int width, int height, char ch, uint16_t attr)
+        {
+            if (width <= 0 || height <= 0)
+                return;
+            const int cols = _parent._buf.cols();
+            const int rows = _parent._buf.rows();
+            for (int ry = 0; ry < height; ++ry)
+            {
+                int ay = abs_y + ry;
+                if (ay < 0 || ay >= rows)
+                    continue;
+                for (int rx = 0; rx < width; ++rx)
+                {
+                    int ax = abs_x + rx;
+                    if (ax < 0 || ax >= cols)
+                        continue;
+                    _parent._buf.at(ax, ay) = Cell{ch, attr};
+                }
+                _parent.mark_line_dirty(ay);
+            }
+        }
+
+        void clamp_to_parent_bounds(int& width, int& height, int& startx, int& starty) const
+        {
+            const int max_cols = _parent._buf.cols();
+            const int max_rows = _parent._buf.rows();
+
+            int min_x = 0;
+            int min_y = 0;
+            int max_x = max_cols;
+            int max_y = max_rows;
+
+            if (_parent_win)
+            {
+                min_x = _parent_win->_startx;
+                min_y = _parent_win->_starty;
+                max_x = _parent_win->_startx + _parent_win->_width;
+                max_y = _parent_win->_starty + _parent_win->_height;
+            }
+
+            startx = std::clamp(startx, min_x, std::max(min_x, max_x - 1));
+            starty = std::clamp(starty, min_y, std::max(min_y, max_y - 1));
+
+            width  = std::clamp(width, 1, std::max(1, max_x - startx));
+            height = std::clamp(height, 1, std::max(1, max_y - starty));
+        }
+
+        void clamp_to_parent_bounds()
+        {
+            int width  = _width;
+            int height = _height;
+            int startx = _startx;
+            int starty = _starty;
+            clamp_to_parent_bounds(width, height, startx, starty);
+            _startx = startx;
+            _starty = starty;
+            _width  = width;
+            _height = height;
+            _curx   = std::clamp(_curx, 0, _width - 1);
+            _cury   = std::clamp(_cury, 0, _height - 1);
+        }
+
+        void adjust_children_after_parent_change()
+        {
+            for (Window* child : _children)
+            {
+                if (!child)
+                    continue;
+                child->clamp_to_parent_bounds();
+                child->touchwin(true);
+            }
+        }
+
+        void move_children(int dx, int dy)
+        {
+            if (dx == 0 && dy == 0)
+                return;
+            for (Window* child : _children)
+            {
+                if (!child)
+                    continue;
+                child->_startx += dx;
+                child->_starty += dy;
+            }
+        }
     };
 
     Curses(ICursesDisplay& disp, ICursesInput& in, IFont& font) :
@@ -625,6 +807,9 @@ public:
         _buf.resize(cols, rows);
         _pairs[0] = {Color{255, 255, 255}, Color{0, 0, 0}};  // white on black
         mark_all_dirty();
+        _resize_pending = false;
+        _resize_rows    = rows;
+        _resize_cols    = cols;
     }
 
     // Init/teardown
@@ -828,6 +1013,43 @@ public:
         return false;
     }
 
+    bool resizeterm(int new_rows, int new_cols)
+    {
+        new_cols = std::clamp(new_cols, 1, MAX_COLS);
+        new_rows = std::clamp(new_rows, 1, MAX_ROWS);
+        if (new_cols == _buf.cols() && new_rows == _buf.rows())
+            return false;
+
+        _buf.resize(new_cols, new_rows);
+        _curx = std::clamp(_curx, 0, new_cols - 1);
+        _cury = std::clamp(_cury, 0, new_rows - 1);
+        mark_all_dirty();
+        for (int i = new_rows; i < static_cast<int>(_dirty_lines.size()); ++i)
+            _dirty_lines[i] = false;
+
+        for (auto& win : _windows)
+        {
+            if (win)
+            {
+                win->clamp_to_parent_bounds();
+                win->touchwin(true);
+            }
+        }
+        _resize_rows = new_rows;
+        _resize_cols = new_cols;
+        return true;
+    }
+
+    bool consume_resize(int& rows, int& cols)
+    {
+        if (!_resize_pending)
+            return false;
+        rows            = std::max(1, _resize_rows);
+        cols            = std::max(1, _resize_cols);
+        _resize_pending = false;
+        return true;
+    }
+
     // Input
     int getch()
     {
@@ -981,6 +1203,19 @@ private:
 
             if (final_char == 0)
             {
+                queue_pending(consumed);
+                return first;
+            }
+
+            if (final_char == 't')
+            {
+                if (params.size() >= 3 && params[0] == 8)
+                {
+                    _resize_rows    = params[1];
+                    _resize_cols    = params[2];
+                    _resize_pending = true;
+                    return KEY_RESIZE;
+                }
                 queue_pending(consumed);
                 return first;
             }
@@ -1183,6 +1418,9 @@ private:
     std::deque<int>                      _pending_keys;
     std::vector<std::unique_ptr<Window>> _windows;
     std::array<bool, MAX_ROWS>           _dirty_lines{};
+    bool                                 _resize_pending = false;
+    int                                  _resize_rows    = 0;
+    int                                  _resize_cols    = 0;
 
     Window* create_window(Window* parent_win, int height, int width, int starty, int startx)
     {
@@ -1453,6 +1691,22 @@ inline WINDOW* subwin(WINDOW* win, int nlines, int ncols, int begin_y, int begin
 inline WINDOW* derwin(WINDOW* win, int nlines, int ncols, int begin_y, int begin_x)
 {
     return win ? win->derwin(nlines, ncols, begin_y, begin_x) : nullptr;
+}
+inline bool wresize(WINDOW* win, int nlines, int ncols)
+{
+    return win ? win->resize(nlines, ncols) : false;
+}
+inline bool mvwin(WINDOW* win, int begin_y, int begin_x)
+{
+    return win ? win->mvwin(begin_y, begin_x) : false;
+}
+inline bool resizeterm(int nlines, int ncols)
+{
+    return scr().resizeterm(nlines, ncols);
+}
+inline bool consume_resize(int& rows, int& cols)
+{
+    return scr().consume_resize(rows, cols);
 }
 inline void wrefresh(WINDOW* win)
 {
